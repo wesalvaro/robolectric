@@ -1,23 +1,57 @@
 package org.robolectric.internal;
 
-import javax.annotation.Nonnull;
+import org.robolectric.ApkLoader;
+import org.robolectric.android.internal.ParallelUniverse;
+import org.robolectric.annotation.Config;
 import org.robolectric.internal.bytecode.Sandbox;
 import org.robolectric.internal.dependency.DependencyJar;
 import org.robolectric.internal.dependency.DependencyResolver;
+import org.robolectric.manifest.AndroidManifest;
 import org.robolectric.res.Fs;
 import org.robolectric.res.FsFile;
 import org.robolectric.res.PackageResourceTable;
 import org.robolectric.res.ResourcePath;
 import org.robolectric.res.ResourceTableFactory;
 
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.ServiceLoader;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+import javax.annotation.Nonnull;
+
 public class SdkEnvironment extends Sandbox {
   private final SdkConfig sdkConfig;
+  private final ExecutorService executorService;
+  private final ParallelUniverseInterface parallelUniverse;
+  private final List<ShadowProvider> shadowProviders;
+
   private FsFile compileTimeSystemResourcesFile;
   private PackageResourceTable systemResourceTable;
 
-  public SdkEnvironment(SdkConfig sdkConfig, ClassLoader robolectricClassLoader) {
+  SdkEnvironment(SdkConfig sdkConfig, boolean useLegacyResources, ClassLoader robolectricClassLoader) {
     super(robolectricClassLoader);
+
     this.sdkConfig = sdkConfig;
+
+    executorService = Executors.newSingleThreadExecutor(r -> {
+      Thread thread = new Thread(
+          "main thread for SdkEnvironment(sdk=" + sdkConfig + "; " +
+              "resources=" + (useLegacyResources ? "legacy" : "binary") + ")");
+      thread.setContextClassLoader(robolectricClassLoader);
+      return thread;
+    });
+
+    parallelUniverse = getParallelUniverse();
+
+    this.shadowProviders = new ArrayList<>();
+    for (ShadowProvider shadowProvider : ServiceLoader.load(ShadowProvider.class, robolectricClassLoader)) {
+      shadowProviders.add(shadowProvider);
+    }
   }
 
   public synchronized FsFile getCompileTimeSystemResourcesFile(DependencyResolver dependencyResolver) {
@@ -55,5 +89,59 @@ public class SdkEnvironment extends Sandbox {
 
   public SdkConfig getSdkConfig() {
     return sdkConfig;
+  }
+
+  public <V> V executeSynchronously(Callable<V> callable) throws Exception {
+    Future<V> future = executorService.submit(callable);
+    return future.get();
+  }
+
+  public void initialize(ApkLoader apkLoader, MethodConfig methodConfig) {
+    parallelUniverse.setSdkConfig(sdkConfig);
+    parallelUniverse.setResourcesMode(methodConfig.useLegacyResources());
+
+    parallelUniverse.setUpApplicationState(
+        apkLoader,
+        methodConfig.getMethod(),
+        methodConfig.getConfig(),
+        methodConfig.getAppManifest(),
+        this);
+  }
+
+  @SuppressWarnings("NewApi")
+  private ParallelUniverseInterface getParallelUniverse() {
+    try {
+      return bootstrappedClass(ParallelUniverse.class)
+          .asSubclass(ParallelUniverseInterface.class)
+          .getConstructor()
+          .newInstance();
+    } catch (ReflectiveOperationException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  public void tearDown() {
+    parallelUniverse.tearDownApplication();
+  }
+
+  public void reset() {
+    for (ShadowProvider shadowProvider : shadowProviders) {
+      shadowProvider.reset();
+    }
+  }
+
+  public interface MethodConfig {
+    Method getMethod();
+
+    Config getConfig();
+
+    AndroidManifest getAppManifest();
+
+    boolean useLegacyResources();
+  }
+
+  @FunctionalInterface
+  public interface CallWithThrowable<T> {
+    void call() throws Throwable;
   }
 }
